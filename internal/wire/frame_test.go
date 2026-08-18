@@ -2,7 +2,10 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -142,5 +145,48 @@ func TestFrame_HeaderTooShort(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("expected unexpected EOF error, got nil")
+	}
+}
+
+func TestReadFrame_RejectsOversizedPayloadBeforeReading(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		pr.Close()
+		pw.Close()
+	})
+
+	// Hand-build a header that LIES about payload size — claims more than
+	// maxPayloadLen, without ever actually sending that much data.
+	header := make([]byte, headerSize)
+	binary.BigEndian.PutUint32(header[0:4], 1)          
+	header[4] = 1                                       
+	binary.BigEndian.PutUint32(header[5:9], maxPayloadLen+1) // Length — a lie
+
+	go func() {
+		pw.Write(header)
+		// Deliberately never write payload bytes. If ReadFrame tries to
+		// read them, this goroutine just sits here forever — and so would
+		// the read on the other end, if the size check weren't in the
+		// right place.
+	}()
+
+	type result struct {
+		frame Frame
+		err   error
+	}
+	done := make(chan result, 1)
+
+	go func() {
+		f, err := ReadFrame(pr)
+		done <- result{f, err}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err == nil {
+			t.Fatal("expected an error for oversized payload length, got nil")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("ReadFrame did not return in time — it likely blocked waiting for payload bytes that were never sent")
 	}
 }
