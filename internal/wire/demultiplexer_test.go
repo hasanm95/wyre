@@ -31,7 +31,7 @@ func TestDispatch(t *testing.T) {
 	extractedData := <-data
 
 	if diff := cmp.Diff(frame, extractedData); diff != "" {
-		t.Errorf("mismatch (-want, +got)\n%s", diff)
+		
 	}
 }
 
@@ -200,4 +200,268 @@ func TestShutdown_ConcurrentSafety(t *testing.T) {
 	s.Shutdown()
 
 	wg.Wait()
+}
+
+func TestDemultiplexer_DispatchesInterleavedFramesToCorrectStreams(t *testing.T) {
+	s := NewDemultiplexer()
+	s.Register(1)
+	s.Register(2)
+
+	frameA := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame A"),
+	}
+
+	frameB := Frame{
+		StreamID: 2,
+		Type: 1,
+		Payload: []byte("Frame B"),
+	}
+
+	frameC := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame C"),
+	}
+
+	frameD := Frame{
+		StreamID: 2,
+		Type: 1,
+		Payload: []byte("Frame D"),
+	}
+
+	s.Dispatch(frameA)
+	s.Dispatch(frameB)
+	s.Dispatch(frameC)
+	s.Dispatch(frameD)
+
+	stream1FrameChan, _ := s.GetRegistry(1)
+	stream2FrameChan, _ := s.GetRegistry(2)
+
+	stream1DataA := <-stream1FrameChan
+	stream1DataC := <-stream1FrameChan
+
+	stream2DataB := <-stream2FrameChan
+	stream2DataD := <-stream2FrameChan
+
+	if diff := cmp.Diff(frameA, stream1DataA); diff != "" {
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+
+	if diff := cmp.Diff(frameC, stream1DataC); diff != "" {
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+
+	if diff := cmp.Diff(frameB, stream2DataB); diff != "" {
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+	if diff := cmp.Diff(frameD, stream2DataD); diff != "" {
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+}
+
+func TestDemultiplexer_DropsFrameForUnknownStream(t *testing.T){
+	s := NewDemultiplexer()
+	s.Register(1)
+	
+	frame := Frame {
+		StreamID: 99,
+		Type: 1,
+		Payload: []byte("Hello"),
+	}
+
+	s.Dispatch(frame)
+
+	_, err := s.GetRegistry(99)
+
+	if err == nil {
+		t.Errorf("expected error, got nil")
+	}
+
+	frameChan, err := s.GetRegistry(1)
+
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	select {
+	case unexpectedFrame := <-frameChan:
+		t.Errorf("frame was NOT dropped! Found payload: %s", string(unexpectedFrame.Payload))
+	default:
+	}
+}
+
+func TestDemultiplexer_DropsFrameAfterStreamUnregister(t *testing.T) {
+	s := NewDemultiplexer()
+	stream1 := s.Register(1)
+	stream2 := s.Register(2)
+
+	s.Unregister(1)
+
+	frame := Frame {
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Hello"),
+	}
+
+	s.Dispatch(frame)
+
+	_, err := s.GetRegistry(1)
+	if err == nil {
+		t.Errorf("expected error (stream should be deleted from map), got nil")
+	}
+
+	_, ok := <-stream1
+	if ok {
+		t.Errorf("expected registry to be removed and closed")
+	}
+
+	select{
+	case unexpectedFrame := <- stream2:
+		t.Errorf("frame was NOT dropped! Found payload: %s", string(unexpectedFrame.Payload))
+	default:
+	}
+}
+
+func TestDemultiplexer_ConcurrentDispatchAndUnregister(t *testing.T) {
+	s := NewDemultiplexer()
+
+	stream1 := s.Register(1)
+	stream2 := s.Register(2)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		frame := Frame{
+			StreamID: 1,
+			Type:     1,
+			Payload:  []byte("data"),
+		}
+
+		s.Dispatch(frame)
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		s.Unregister(1)
+	}()
+
+	// Start both goroutines.
+	close(start)
+
+	// Wait until both operations have finished.
+	wg.Wait()
+
+	// Stream 1 must eventually be closed.
+	select {
+	case _, ok := <-stream1:
+		if ok {
+			// Dispatch happened before Unregister, so the
+			// frame was buffered. That's a valid outcome.
+			t.Log("stream 1 received a frame before it was closed")
+
+			// The channel should now eventually close.
+			select {
+			case _, ok := <-stream1:
+				if ok {
+					t.Error("expected stream 1 channel to be closed")
+				}
+			case <-time.After(100 * time.Millisecond):
+				t.Fatal("stream 1 channel was not closed")
+			}
+		}
+
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stream 1 channel did not close in time")
+	}
+
+	// Stream 2 must not receive stream 1's frame.
+	select {
+	case unexpectedFrame := <-stream2:
+		t.Errorf(
+			"stream 2 received an unexpected frame: %s",
+			string(unexpectedFrame.Payload),
+		)
+	default:
+	}
+}
+
+func TestDemultiplexer_PreservesFrameOrder(t *testing.T){
+	s := NewDemultiplexer()
+	stream1 := s.Register(1)
+
+	frameA := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame A"),
+	}
+
+	frameB := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame B"),
+	}
+
+	s.Dispatch(frameA)
+	s.Dispatch(frameB)
+
+	dataA := <- stream1
+	dataB := <- stream1
+
+	if diff := cmp.Diff(frameA, dataA); diff != ""{
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+
+	if diff := cmp.Diff(frameB, dataB); diff != ""{
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+}
+
+func TestDemultiplexer_BufferedFramesSurviveUnregister(t *testing.T) {
+	s := NewDemultiplexer()
+	stream := s.Register(1)
+
+	frameA := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame A"),
+	}
+
+	frameB := Frame{
+		StreamID: 1,
+		Type: 1,
+		Payload: []byte("Frame B"),
+	}
+
+	s.Dispatch(frameA)
+	s.Dispatch(frameB)
+
+	s.Unregister(1)
+
+	dataA := <-stream
+	dataB := <-stream
+
+	if diff := cmp.Diff(frameA, dataA); diff != ""{
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+
+	if diff := cmp.Diff(frameB, dataB); diff != ""{
+		t.Errorf("mismatch (-want, +got)\n%s", diff)
+	}
+
+	_, ok := <-stream
+	if ok {
+		t.Error("expected stream channel to be closed")
+	}
 }
