@@ -1,7 +1,9 @@
 package client
 
 import (
+	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -62,7 +64,11 @@ func (c *Client) newStreamID() uint32 {
 
 const callTimeout = 3 * time.Second
 
-func (c *Client) Call(method string, request []byte) ([]byte, error) {
+func (c *Client) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
+	if err := c.ensureConnected(ctx); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
 	conn := c.conn
 	demux := c.demux
@@ -95,4 +101,49 @@ func (c *Client) Call(method string, request []byte) ([]byte, error) {
 
 func (c *Client) Closed() <-chan struct{} {
 	return c.closed
+}
+
+const (
+	maxReconnectAttempts = 3
+	baseDelay            = 500 * time.Millisecond 
+	maxDelay             = 5 * time.Second 
+)
+
+func (c *Client) ensureConnected(ctx context.Context) error {
+	select {
+	case <-c.Closed():
+		// dead, fall through to reconnect
+	default:
+		return nil // still alive, nothing to do
+	}
+
+	var err error
+	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
+		if err = c.connect(); err == nil {
+			return nil
+		}
+
+		if attempt == maxReconnectAttempts {
+			break
+		}
+
+		delay := baseDelay * (1 << uint(attempt-1))
+
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+
+		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
+		totalSleep := delay + jitter
+
+		fmt.Printf("Reconnect attempt %d failed. Retrying in %v...\n", attempt, totalSleep)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("reconnection aborted: %w", ctx.Err())
+		case <-time.After(totalSleep):
+			// Sleep finished, loop continues to the next connection attempt
+		}
+	}
+	return fmt.Errorf("failed to reconnect after %d attempts: %w", maxReconnectAttempts, err)
 }

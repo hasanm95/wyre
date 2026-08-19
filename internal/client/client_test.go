@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/hasanm95/wyre/internal/server"
+	wyreproto "github.com/hasanm95/wyre/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestDial_ConnectsSuccessfully(t *testing.T) {
@@ -44,8 +46,25 @@ func TestClient_NewStreamID_ReturnsUniqueIncreasingValues(t *testing.T) {
 
 func TestClient_Call_ReturnsServerResponse(t *testing.T) {
 	dispatcher := server.NewDispatcher()
+
+	requestData, err := proto.Marshal(&wyreproto.HelloRequest{
+		Name: "Hasan",
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+
 	dispatcher.Register("Greeter.SayHello", func(payload []byte) ([]byte, error) {
-		return []byte("Hello, " + string(payload)), nil
+		request := &wyreproto.HelloRequest{}
+		if err := proto.Unmarshal(payload, request); err != nil {
+			return nil, err
+		}
+
+		response := &wyreproto.HelloResponse{
+			Message: "Hello, " + request.Name,
+		}
+
+		return proto.Marshal(response)
 	})
 
 	srv := server.NewServer(dispatcher)
@@ -59,13 +78,19 @@ func TestClient_Call_ReturnsServerResponse(t *testing.T) {
 		t.Fatalf("failed to dial: %v", err)
 	}
 
-	resp, err := c.Call("Greeter.SayHello", []byte("Hasan"))
+	resp, err := c.Call(t.Context(), "Greeter.SayHello", requestData)
 	if err != nil {
 		t.Fatalf("call failed: %v", err)
 	}
 
-	if string(resp) != "Hello, Hasan" {
-		t.Errorf("expected 'Hello, Hasan', got %q", resp)
+	response := &wyreproto.HelloResponse{}
+
+	if err := proto.Unmarshal(resp, response); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+
+	if response.Message != "Hello, Hasan" {
+		t.Errorf("expected %q, got %q", "Hello, Hasan", response.Message)
 	}
 }
 
@@ -94,7 +119,7 @@ func TestClient_Call_ConcurrentCallsGetCorrectResponses(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			req := fmt.Sprintf("req-%d", i)
-			resp, err := c.Call("Echo", []byte(req))
+			resp, err := c.Call(t.Context(), "Echo", []byte(req))
 			if err != nil {
 				t.Errorf("call %d failed: %v", i, err)
 				return
@@ -125,7 +150,7 @@ func TestClient_Call_TimesOutWhenNoResponseArrives(t *testing.T) {
 		t.Fatalf("failed to dial: %v", err)
 	}
 
-	_, err = c.Call("Slow", []byte("hi"))
+	_, err = c.Call(t.Context(), "Slow", []byte("hi"))
 	if err == nil {
 		t.Fatal("expected a timeout error, got nil")
 	}
@@ -178,11 +203,112 @@ func TestClient_Reconnect_RestoresWorkingConnection(t *testing.T) {
 		t.Fatalf("failed to reconnect: %v", err)
 	}
 
-	resp, err := c.Call("Echo", []byte("hello again"))
+	resp, err := c.Call(t.Context(), "Echo", []byte("hello again"))
 	if err != nil {
 		t.Fatalf("call after reconnect failed: %v", err)
 	}
 	if string(resp) != "hello again" {
 		t.Errorf("expected %q, got %q", "hello again", resp)
+	}
+}
+
+func TestClient_Call_AutomaticallyReconnectsAfterConnectionDies(t *testing.T) {
+	dispatcher := server.NewDispatcher()
+	dispatcher.Register("Echo", func(payload []byte) ([]byte, error) {
+		return payload, nil
+	})
+
+	srv := server.NewServer(dispatcher)
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	go srv.Serve()
+
+	c, err := Dial(srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	c.conn.Close()
+	<-c.Closed()
+
+	resp, err := c.Call(t.Context(), "Echo", []byte("automatic"))
+	if err != nil {
+		t.Fatalf("call failed: %v", err)
+	}
+	if string(resp) != "automatic" {
+		t.Errorf("expected %q, got %q", "automatic", resp)
+	}
+}
+
+func TestClient_Call_FailsCleanlyWhenServerDiesMidCall(t *testing.T) {
+	dispatcher := server.NewDispatcher()
+	dispatcher.Register("Slow", func(payload []byte) ([]byte, error) {
+		select {} // never returns, simulates a handler that hangs forever
+	})
+
+	srv := server.NewServer(dispatcher)
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	go srv.Serve()
+
+	c, err := Dial(srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	type callResult struct {
+		data []byte
+		err error 
+	}
+
+	done := make(chan callResult, 1)
+
+	go func ()  {
+		data, err := c.Call(t.Context(), "Slow", []byte("hi"))
+		done <- callResult{data, err}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	c.conn.Close()
+
+	select {
+	case res := <- done:
+		if res.err == nil {
+			t.Errorf("expected an error, got nil (response: %v)", res.data)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Errorf("expected fast failure, but call was still hanging")
+	}
+}
+
+func TestClient_EnsureConnected_BacksOffBetweenFailedAttempts(t *testing.T) {
+	srv := server.NewServer(server.NewDispatcher())
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	addr := srv.Addr().String()
+	srv.Close() // nobody is listening on addr now
+
+	c := &Client{address: addr}
+	closed := make(chan struct{})
+	close(closed)
+
+	c.mu.Lock()
+	c.closed = closed
+	c.mu.Unlock()
+
+	start := time.Now()
+	err := c.ensureConnected(t.Context())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Errorf("expected an error since nobody is listening on %s, got nil", addr)
+	}
+
+	if elapsed <= 140*time.Millisecond {
+		t.Errorf("expected reconnect to back off for at least ~150ms across attempts, only took %v", elapsed)
 	}
 }
