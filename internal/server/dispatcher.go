@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -12,6 +13,8 @@ type Dispatcher struct {
 	mu sync.Mutex
 	methods map[string]Handler
 }
+
+var ErrMethodNotFound = errors.New("method not found")
 
 func NewDispatcher() *Dispatcher  {
 	return &Dispatcher{
@@ -39,7 +42,7 @@ func (d *Dispatcher) Dispatch(methodName string, request []byte)([]byte, error) 
 	handler, ok := d.Lookup(methodName)
 
 	if !ok {
-		return nil, fmt.Errorf("method %q not found", methodName)
+		return nil, fmt.Errorf("%w: %q", ErrMethodNotFound, methodName)
 	}
 
 	response, err := handler(request)

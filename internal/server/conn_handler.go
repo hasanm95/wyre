@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -60,6 +61,20 @@ func (h *ConnHandler) runCall(streamID uint32, methodName string, ch <-chan wire
 	response, err := h.dispatcher.Dispatch(methodName, dataFrame.Payload)
 	if err != nil {
 		log.Printf("dispatch error for stream %d, method %q: %v", streamID, methodName, err)
+
+		statusCode := wire.StatusInternal
+		if errors.Is(err, ErrMethodNotFound) {
+			statusCode = wire.StatusNotFound
+		}
+
+		statusFrame := wire.Frame {
+			StreamID: streamID,
+			Type: wire.FrameTypeStatus,
+			Payload: wire.EncodeStatus(statusCode, err.Error()),
+		}
+		if err := h.writeFrame(statusFrame); err != nil {
+			log.Printf("failed to write status for stream %d: %v", streamID, err)
+		}
 		return
 	}
 
@@ -69,6 +84,14 @@ func (h *ConnHandler) runCall(streamID uint32, methodName string, ch <-chan wire
 		Payload:  response,
 	}); err != nil {
 		log.Printf("failed to write response for stream %d: %v", streamID, err)
+	}
+
+	if err := h.writeFrame(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeStatus,
+		Payload:  wire.EncodeStatus(wire.StatusOK, ""),
+	}); err != nil {
+		log.Printf("failed to write status frame for stream %d: %v", streamID, err)
 	}
 }
 

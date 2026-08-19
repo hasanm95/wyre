@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 func TestConnHandler_HandlesSingleCall(t *testing.T) {
 	c1, c2 := net.Pipe()
+
 	t.Cleanup(func() {
 		c1.Close()
 		c2.Close()
@@ -24,14 +26,21 @@ func TestConnHandler_HandlesSingleCall(t *testing.T) {
 	handler := NewConnHandler(c2, dispatcher)
 
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- handler.Serve() }()
+	go func() {
+		serveErr <- handler.Serve()
+	}()
 
 	go func() {
 		c1.Write(wire.EncodeFrame(wire.Frame{
-			StreamID: 1, Type: wire.FrameTypeHeader, Payload: []byte("Greeter.SayHello"),
+			StreamID: 1,
+			Type:     wire.FrameTypeHeader,
+			Payload:  []byte("Greeter.SayHello"),
 		}))
+
 		c1.Write(wire.EncodeFrame(wire.Frame{
-			StreamID: 1, Type: wire.FrameTypeData, Payload: []byte("Hasan"),
+			StreamID: 1,
+			Type:     wire.FrameTypeData,
+			Payload:  []byte("Hasan"),
 		}))
 	}()
 
@@ -39,11 +48,43 @@ func TestConnHandler_HandlesSingleCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read response frame: %v", err)
 	}
+
 	if respFrame.StreamID != 1 {
 		t.Errorf("expected stream ID 1, got %d", respFrame.StreamID)
 	}
+
+	if respFrame.Type != wire.FrameTypeData {
+		t.Errorf("expected FrameTypeData, got %d", respFrame.Type)
+	}
+
 	if string(respFrame.Payload) != "Hello, Hasan" {
 		t.Errorf("expected 'Hello, Hasan', got %q", respFrame.Payload)
+	}
+
+	statusFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read status frame: %v", err)
+	}
+
+	if statusFrame.StreamID != 1 {
+		t.Errorf("expected status stream ID 1, got %d", statusFrame.StreamID)
+	}
+
+	if statusFrame.Type != wire.FrameTypeStatus {
+		t.Errorf("expected FrameTypeStatus, got %d", statusFrame.Type)
+	}
+
+	code, message, err := wire.DecodeStatus(statusFrame.Payload)
+	if err != nil {
+		t.Fatalf("failed to decode status: %v", err)
+	}
+
+	if code != wire.StatusOK {
+		t.Errorf("expected status %v, got %v", wire.StatusOK, code)
+	}
+
+	if message != "" {
+		t.Errorf("expected empty status message, got %q", message)
 	}
 
 	c1.Close()
@@ -76,11 +117,55 @@ func TestConnHandler_ConcurrentCallsGetCorrectResponses(t *testing.T) {
 
 	responses := map[uint32]string{}
 	for i := 0; i < 2; i++ {
-		f, err := wire.ReadFrame(c1)
+		dataFrame, err := wire.ReadFrame(c1)
 		if err != nil {
 			t.Fatalf("failed to read response frame: %v", err)
 		}
-		responses[f.StreamID] = string(f.Payload)
+
+		if dataFrame.Type != wire.FrameTypeData {
+			t.Fatalf("expected FrameTypeData, got %d", dataFrame.Type)
+		}
+
+		responses[dataFrame.StreamID] = string(dataFrame.Payload)
+
+		statusFrame, err := wire.ReadFrame(c1)
+		if err != nil {
+			t.Fatalf("failed to read status frame: %v", err)
+		}
+
+		if statusFrame.StreamID != dataFrame.StreamID {
+			t.Errorf(
+				"expected status stream ID %d, got %d",
+				dataFrame.StreamID,
+				statusFrame.StreamID,
+			)
+		}
+
+		if statusFrame.Type != wire.FrameTypeStatus {
+			t.Errorf("expected FrameTypeStatus, got %d", statusFrame.Type)
+		}
+
+		code, message, err := wire.DecodeStatus(statusFrame.Payload)
+		if err != nil {
+			t.Fatalf("failed to decode status: %v", err)
+		}
+
+		if code != wire.StatusOK {
+			t.Errorf(
+				"expected status %v for stream %d, got %v",
+				wire.StatusOK,
+				statusFrame.StreamID,
+				code,
+			)
+		}
+
+		if message != "" {
+			t.Errorf(
+				"expected empty status message for stream %d, got %q",
+				statusFrame.StreamID,
+				message,
+			)
+		}
 	}
 
 	if responses[1] != "first" {
@@ -107,17 +192,31 @@ func TestConnHandler_UnknownMethod_NoResponseSent(t *testing.T) {
 		c1.Write(wire.EncodeFrame(wire.Frame{StreamID: 1, Type: wire.FrameTypeData, Payload: []byte("hi")}))
 	}()
 
-	readDone := make(chan struct{})
-	go func() {
-		wire.ReadFrame(c1) // documents the known gap: this should never return
-		close(readDone)
-	}()
+	respFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read response frame: %v", err)
+	}
 
-	select {
-	case <-readDone:
-		t.Fatal("expected no response for an unknown method (documented known gap) — one arrived unexpectedly")
-	case <-time.After(200 * time.Millisecond):
-		// expected: no response ever comes
+	if respFrame.StreamID != 1 {
+		t.Errorf("expected stream ID 1, got %d", respFrame.StreamID)
+	}
+
+	if respFrame.Type != wire.FrameTypeStatus {
+		t.Errorf("expected status frame, got %d", respFrame.Type)
+	}
+
+	code, message, err := wire.DecodeStatus(respFrame.Payload)
+
+	if err != nil {
+		t.Fatalf("failed to decode status: %v", err)
+	}
+
+	if code != wire.StatusNotFound {
+		t.Errorf("expected status %v, got %v", wire.StatusNotFound, code)
+	}
+
+	if message == "" {
+		t.Error("expected a non-empty status message")
 	}
 }
 
@@ -177,5 +276,138 @@ func TestConnHandler_WriteFrame(t *testing.T) {
 
 	if diff := cmp.Diff(frame, got); diff != "" {
 		t.Errorf("mismatch (-want, +got):\n%s", diff)
+	}
+}
+
+func TestConnHandler_SuccessfulCall_SendsOKStatus(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	dispatcher := NewDispatcher()
+	dispatcher.Register("Greeter.SayHello", func(payload []byte) ([]byte, error) {
+		return []byte("Hello, " + string(payload)), nil
+	})
+
+	handler := NewConnHandler(c2, dispatcher)
+	go handler.Serve()
+
+	go func() {
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1,
+			Type:     wire.FrameTypeHeader,
+			Payload:  []byte("Greeter.SayHello"),
+		}))
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1,
+			Type:     wire.FrameTypeData,
+			Payload:  []byte("Hasan"),
+		}))
+	}()
+
+	respFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read response frame: %v", err)
+	}
+
+	if respFrame.StreamID != 1 {
+		t.Errorf("expected stream ID 1, got %d", respFrame.StreamID)
+	}
+
+	if respFrame.Type != wire.FrameTypeData {
+		t.Errorf("expected FrameTypeData, got %d", respFrame.Type)
+	}
+
+	if string(respFrame.Payload) != "Hello, Hasan" {
+		t.Errorf("expected 'Hello, Hasan', got %q", respFrame.Payload)
+	}
+
+	statusFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read status frame: %v", err)
+	}
+
+	if statusFrame.StreamID != 1 {
+		t.Errorf("expected status stream ID 1, got %d", statusFrame.StreamID)
+	}
+
+	if statusFrame.Type != wire.FrameTypeStatus {
+		t.Errorf("expected FrameTypeStatus, got %d", statusFrame.Type)
+	}
+
+	code, message, err := wire.DecodeStatus(statusFrame.Payload)
+	if err != nil {
+		t.Fatalf("failed to decode status: %v", err)
+	}
+
+	if code != wire.StatusOK {
+		t.Errorf("expected status %v, got %v", wire.StatusOK, code)
+	}
+
+	if message != "" {
+		t.Errorf("expected empty status message, got %q", message)
+	}
+}
+
+func TestConnHandler_HandlerError_SendsInternalStatus(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	dispatcher := NewDispatcher()
+
+	expectedError := "handler failed"
+
+	dispatcher.Register("Greeter.SayHello", func(payload []byte) ([]byte, error) {
+		return nil, fmt.Errorf("%s", expectedError)
+	})
+
+	handler := NewConnHandler(c2, dispatcher)
+	go handler.Serve()
+
+	go func() {
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1,
+			Type:     wire.FrameTypeHeader,
+			Payload:  []byte("Greeter.SayHello"),
+		}))
+
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1,
+			Type:     wire.FrameTypeData,
+			Payload:  []byte("Hasan"),
+		}))
+	}()
+
+	respFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read response frame: %v", err)
+	}
+
+	if respFrame.StreamID != 1 {
+		t.Errorf("expected stream ID 1, got %d", respFrame.StreamID)
+	}
+
+	if respFrame.Type != wire.FrameTypeStatus {
+		t.Errorf("expected FrameTypeStatus, got %d", respFrame.Type)
+	}
+
+	code, message, err := wire.DecodeStatus(respFrame.Payload)
+	if err != nil {
+		t.Fatalf("failed to decode status: %v", err)
+	}
+
+	if code != wire.StatusInternal {
+		t.Errorf("expected status %v, got %v", wire.StatusInternal, code)
+	}
+
+	if message != expectedError {
+		t.Errorf("expected message %q, got %q", expectedError, message)
 	}
 }
