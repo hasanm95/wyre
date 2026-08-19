@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -88,15 +89,19 @@ func (c *Client) Call(ctx context.Context, method string, request []byte) ([]byt
 		return nil, fmt.Errorf("failed to write data frame: %w", err)
 	}
 
-	select {
-	case respFrame, ok := <-ch:
-		if !ok {
-			return nil, fmt.Errorf("connection closed before response arrived")
+	callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+
+	response, err := readCallResponse(callCtx, ch)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("call to %q timed out after %s", method, callTimeout)
 		}
-		return respFrame.Payload, nil
-	case <-time.After(callTimeout):
-		return nil, fmt.Errorf("call to %q timed out after %s", method, callTimeout)
+
+		return nil, err
 	}
+
+	return response, nil
 }
 
 func (c *Client) Closed() <-chan struct{} {

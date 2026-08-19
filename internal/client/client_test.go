@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hasanm95/wyre/internal/server"
+	"github.com/hasanm95/wyre/internal/wire"
 	wyreproto "github.com/hasanm95/wyre/proto"
 	"google.golang.org/protobuf/proto"
 )
@@ -310,5 +311,69 @@ func TestClient_EnsureConnected_BacksOffBetweenFailedAttempts(t *testing.T) {
 
 	if elapsed <= 140*time.Millisecond {
 		t.Errorf("expected reconnect to back off for at least ~150ms across attempts, only took %v", elapsed)
+	}
+}
+
+func TestClient_Call_ReturnsNotFoundStatus(t *testing.T) {
+	srv := server.NewServer(server.NewDispatcher())
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	go srv.Serve()
+
+	c, err := Dial(srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	_, err = c.Call(t.Context(), "Greeter.Unknown", []byte(""))
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestClient_Call_HandlerError_ReturnsInternalStatus(t *testing.T) {
+	dispatcher := server.NewDispatcher()
+
+	dispatcher.Register("Greeter.SayHello", func(payload []byte) ([]byte, error) {
+		return nil, fmt.Errorf("handler failed")
+	})
+
+	srv := server.NewServer(dispatcher)
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	go srv.Serve()
+
+	c, err := Dial(srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	_, err = c.Call(t.Context(), "Greeter.SayHello", []byte("Hasan"))
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	statusErr, ok := err.(*StatusError)
+	if !ok {
+		t.Fatalf("expected *StatusError, got %T", err)
+	}
+
+	if statusErr.Code != wire.StatusInternal {
+		t.Errorf(
+			"expected status %v, got %v",
+			wire.StatusInternal,
+			statusErr.Code,
+		)
+	}
+
+	if statusErr.Message != "handler failed" {
+		t.Errorf(
+			"expected message %q, got %q",
+			"handler failed",
+			statusErr.Message,
+		)
 	}
 }
