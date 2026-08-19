@@ -465,3 +465,71 @@ func TestDemultiplexer_BufferedFramesSurviveUnregister(t *testing.T) {
 		t.Error("expected stream channel to be closed")
 	}
 }
+
+func TestDemultiplexer_OnUnregistered_InvokedForUnknownStream(t *testing.T) {
+	s := NewDemultiplexer()
+
+	var received Frame
+	called := make(chan struct{})
+
+	s.OnUnregistered(func(f Frame) {
+		received = f
+		close(called)
+	})
+
+	frame := Frame{
+		StreamID: 99,
+		Type:     FrameTypeHeader,
+		Payload:  []byte("Greeter.SayHello"),
+	}
+
+	s.Dispatch(frame)
+
+	select {
+	case <-called:
+		if diff := cmp.Diff(frame, received); diff != "" {
+			t.Errorf("mismatch (-want, +got):\n%s", diff)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("handler was not called in time")
+	}
+}
+
+func TestDemultiplexer_OnUnregistered_NotCalledForRegisteredStream(t *testing.T) {
+	s := NewDemultiplexer()
+	stream := s.Register(5)
+
+	called := false
+	s.OnUnregistered(func(f Frame) {
+		called = true
+	})
+
+	frame := Frame{StreamID: 5, Type: FrameTypeData, Payload: []byte("hello")}
+	s.Dispatch(frame)
+
+	<-stream 
+
+	if called {
+		t.Error("unregistered handler should NOT fire for a registered stream")
+	}
+}
+
+func TestDemultiplexer_OnUnregistered_HandlerCanRegisterWithoutDeadlock(t *testing.T) {
+	s := NewDemultiplexer()
+
+	done := make(chan struct{})
+
+	s.OnUnregistered(func(f Frame) {
+		s.Register(f.StreamID)
+		close(done)
+	})
+
+	frame := Frame{StreamID: 7, Type: FrameTypeHeader, Payload: []byte("Greeter.SayHello")}
+	s.Dispatch(frame)
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("handler blocked — likely a deadlock from calling Register() inside the handler")
+	}
+}

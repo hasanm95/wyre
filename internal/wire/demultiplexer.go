@@ -15,11 +15,12 @@ type streamChannel struct {
 }
 
 type Demultiplexer struct {
-	mu        sync.Mutex
-	registry  map[uint32]*streamChannel
-	isClosed  bool
-	closeChan chan struct{}
-	closeOnce sync.Once
+	mu                  sync.Mutex
+	registry            map[uint32]*streamChannel
+	isClosed            bool
+	closeChan           chan struct{}
+	closeOnce           sync.Once
+	unregisteredHandler func(Frame)
 }
 
 const chanSize = 2
@@ -67,15 +68,19 @@ func (s *Demultiplexer) Register(streamID uint32) <-chan Frame {
 func (s *Demultiplexer) Dispatch(f Frame) {
 	select {
 	case <-s.closeChan:
-		return 
+		return
 	default:
 	}
 
 	s.mu.Lock()
 	stream, exists := s.registry[f.StreamID]
-	s.mu.Unlock()
+	handler := s.unregisteredHandler
+	s.mu.Unlock()              
 
 	if !exists {
+		if handler != nil {
+			handler(f)
+		}
 		return
 	}
 
@@ -90,7 +95,6 @@ func (s *Demultiplexer) Dispatch(f Frame) {
 		stream.mu.Unlock()
 		return
 	case stream.ch <- f:
-		// Success
 	default:
 		log.Printf("Stream %d buffer is full! Dropping frame.", f.StreamID)
 	}
@@ -144,4 +148,10 @@ func (s *Demultiplexer) Shutdown() {
 		}
 		log.Println("System shutdown completed successfully.")
 	})
+}
+
+func (s *Demultiplexer) OnUnregistered(handler func(Frame)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unregisteredHandler = handler
 }

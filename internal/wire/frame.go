@@ -11,6 +11,11 @@ const (
 	maxPayloadLen = 10 * 1024 * 1024 // 10MB
 )
 
+const (
+    FrameTypeHeader uint8 = 1
+    FrameTypeData   uint8 = 2
+)
+
 type Frame struct {
 	StreamID uint32
 	Type     uint8

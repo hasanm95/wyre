@@ -190,3 +190,34 @@ func TestReadFrame_RejectsOversizedPayloadBeforeReading(t *testing.T) {
 		t.Fatal("ReadFrame did not return in time — it likely blocked waiting for payload bytes that were never sent")
 	}
 }
+
+func TestFrame_TypeConstants(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  uint8
+	}{
+		{name: "header frame", typ: FrameTypeHeader},
+		{name: "data frame", typ: FrameTypeData},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := Frame{
+				StreamID: 1,
+				Type:     tt.typ,
+				Payload:  []byte("Greeter.SayHello"),
+			}
+
+			data := EncodeFrame(frame)
+
+			decoded, err := DecodeFrame(data)
+			if err != nil {
+				t.Fatalf("failed to decode frame: %v", err)
+			}
+
+			if diff := cmp.Diff(frame, decoded); diff != "" {
+				t.Errorf("mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
