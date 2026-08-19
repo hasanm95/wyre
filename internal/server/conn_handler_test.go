@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/hasanm95/wyre/internal/wire"
 )
 
@@ -143,5 +144,38 @@ func TestConnHandler_ConnectionClosedBeforeDataFrame(t *testing.T) {
 		}
 	case <-time.After(200 * time.Millisecond):
 		t.Fatal("Serve did not return after connection close — possible goroutine leak/hang")
+	}
+}
+
+func TestConnHandler_WriteFrame(t *testing.T) {
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	handler := NewConnHandler(c2, NewDispatcher())
+
+	frame := wire.Frame{
+		StreamID: 1,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("Hello Hasan"),
+	}
+
+	go func() {
+		err := handler.writeFrame(frame)
+
+		if err != nil {
+			t.Errorf("writeFrame failed: %v", err)
+		}
+	}()
+
+	got, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read frame: %v", err)
+	}
+
+	if diff := cmp.Diff(frame, got); diff != "" {
+		t.Errorf("mismatch (-want, +got):\n%s", diff)
 	}
 }
