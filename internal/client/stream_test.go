@@ -25,6 +25,7 @@ func TestClientStream_Recv_ReturnsData(t *testing.T){
 		StreamID: 1,
 		ch: ch,
 		ctx: t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -50,6 +51,7 @@ func TestClientStream_Recv_ReturnsEOFOnEnd(t *testing.T) {
 		StreamID: 1,
 		ch: ch,
 		ctx: t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -76,6 +78,7 @@ func TestClientStream_Recv_ReturnsStatusError(t *testing.T) {
 		StreamID: 1,
 		ch:       ch,
 		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -132,6 +135,7 @@ func TestClientStream_Recv_MultipleDataThenEOF(t *testing.T) {
 		StreamID: 1,
 		ch:       ch,
 		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -166,6 +170,7 @@ func TestClientStream_Recv_ClosedChannel(t *testing.T) {
 		StreamID: 1,
 		ch:       ch,
 		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -191,6 +196,7 @@ func TestClientStream_Recv_InvalidStatus(t *testing.T) {
 		StreamID: 1,
 		ch:       ch,
 		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
 	}
 
 	data, err := cs.Recv()
@@ -214,6 +220,7 @@ func TestClientStream_Recv_ContextCancelled(t *testing.T) {
 		StreamID: 1,
 		ch:       ch,
 		ctx:      ctx,
+		demux: wire.NewDemultiplexer(),
 	}
 
 	cancel()
@@ -315,5 +322,384 @@ func TestClient_Stream_SendsHeaderAndData(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Stream did not return")
+	}
+}
+
+func TestClient_Stream_WriteFailure_UnregistersStream(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		conn:   c1,
+		demux:  demux,
+		closed: closed,
+	}
+
+	// Force the next write to fail.
+	c1.Close()
+
+	stream, err := c.Stream(
+		t.Context(),
+		"Echo",
+		[]byte("payload"),
+	)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if stream != nil {
+		t.Fatalf("expected nil stream, got %+v", stream)
+	}
+
+	// The first stream ID should be 1.
+	_, err = demux.GetRegistry(1)
+	if err == nil {
+		t.Error("expected stream to be unregistered after write failure")
+	}
+}
+
+func TestClient_Stream_RemainsRegistered(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		conn:   c1,
+		demux:  demux,
+		closed: closed,
+	}
+
+	type streamResult struct {
+		stream *ClientStream
+		err    error
+	}
+
+	resultCh := make(chan streamResult, 1)
+
+	go func() {
+		stream, err := c.Stream(
+			t.Context(),
+			"Echo",
+			[]byte("payload"),
+		)
+
+		resultCh <- streamResult{
+			stream: stream,
+			err:    err,
+		}
+	}()
+
+	// Read the HEADER frame.
+	header, err := wire.ReadFrame(c2)
+	if err != nil {
+		t.Fatalf("failed to read header frame: %v", err)
+	}
+
+	if header.Type != wire.FrameTypeHeader {
+		t.Errorf("expected header frame, got %d", header.Type)
+	}
+
+	// Read the DATA frame.
+	data, err := wire.ReadFrame(c2)
+	if err != nil {
+		t.Fatalf("failed to read data frame: %v", err)
+	}
+
+	if data.Type != wire.FrameTypeData {
+		t.Errorf("expected data frame, got %d", data.Type)
+	}
+
+	// Wait for Stream() to finish.
+	result := <-resultCh
+
+	if result.err != nil {
+		t.Fatalf("Stream failed: %v", result.err)
+	}
+
+	if result.stream == nil {
+		t.Fatal("expected non-nil stream")
+	}
+
+	// The stream must still be registered after Stream() returns.
+	ch, err := demux.GetRegistry(result.stream.StreamID)
+	if err != nil {
+		t.Fatalf("expected stream to remain registered: %v", err)
+	}
+
+	if ch == nil {
+		t.Fatal("expected registered stream channel, got nil")
+	}
+}
+
+func TestClient_Stream_RecvReceivesDispatchedData(t *testing.T) {
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		address: "unused",
+		demux:   demux,
+		closed:  closed,
+	}
+
+	streamID := c.newStreamID()
+	ch := demux.Register(streamID)
+
+	stream := &ClientStream{
+		StreamID: streamID,
+		ch:       ch,
+		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
+	}
+
+	frame := wire.Frame{
+		StreamID: stream.StreamID,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("frame data"),
+	}
+
+	c.demux.Dispatch(frame)
+
+	data, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv failed: %v", err)
+	}
+
+	if string(data) != "frame data" {
+		t.Errorf("expected %q, got %q", "frame data", data)
+	}
+}
+
+func TestClient_Stream_RecvEndReturnsEOF(t *testing.T) {
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		address: "unused",
+		demux:   demux,
+		closed:  closed,
+	}
+
+	streamID := c.newStreamID()
+	ch := demux.Register(streamID)
+
+	stream := &ClientStream{
+		StreamID: streamID,
+		ch:       ch,
+		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
+	}
+
+	frame := wire.Frame {
+		StreamID: streamID,
+		Type: wire.FrameTypeEnd,
+		Payload: []byte(""),
+	}
+
+	demux.Dispatch(frame)
+
+	data, err := stream.Recv()
+
+	if err != io.EOF {
+		t.Errorf("expected io.EOF, got %v", err)
+	}
+
+	if data != nil {
+		t.Errorf("expected nil data, got %q", data)
+	}
+}
+
+func TestClientStream_RecvMultipleFrames(t *testing.T) {
+	demux := wire.NewDemultiplexer()
+	streamID := uint32(1)
+
+	ch := demux.Register(streamID)
+
+	stream := &ClientStream{
+		StreamID: streamID,
+		ch:       ch,
+		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
+	}
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("hello"),
+	})
+
+	data, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("first Recv: expected no error, got %v", err)
+	}
+
+	if string(data) != "hello" {
+		t.Errorf("first Recv: expected %q, got %q", "hello", data)
+	}
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("world"),
+	})
+
+	data, err = stream.Recv()
+	if err != nil {
+		t.Fatalf("second Recv: expected no error, got %v", err)
+	}
+
+	if string(data) != "world" {
+		t.Errorf("second Recv: expected %q, got %q", "world", data)
+	}
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeEnd,
+	})
+
+	data, err = stream.Recv()
+	if err != io.EOF {
+		t.Errorf("third Recv: expected io.EOF, got %v", err)
+	}
+
+	if data != nil {
+		t.Errorf("third Recv: expected nil data, got %q", data)
+	}
+}
+
+
+func TestClientStream_MultipleStreamsDoNotMixFrames(t *testing.T) {
+	demux := wire.NewDemultiplexer()
+
+	streamID1 := uint32(1)
+	streamID2 := uint32(2)
+
+	ch1 := demux.Register(streamID1)
+	ch2 := demux.Register(streamID2)
+
+	stream1 := &ClientStream{
+		StreamID: streamID1,
+		ch:       ch1,
+		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
+	}
+
+	stream2 := &ClientStream{
+		StreamID: streamID2,
+		ch:       ch2,
+		ctx:      t.Context(),
+		demux: wire.NewDemultiplexer(),
+	}
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID2,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("stream two"),
+	})
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID1,
+		Type:     wire.FrameTypeData,
+		Payload:  []byte("stream one"),
+	})
+
+	data, err := stream1.Recv()
+	if err != nil {
+		t.Fatalf("stream1 Recv failed: %v", err)
+	}
+
+	if string(data) != "stream one" {
+		t.Errorf("stream1 expected %q, got %q", "stream one", data)
+	}
+
+	data, err = stream2.Recv()
+	if err != nil {
+		t.Fatalf("stream2 Recv failed: %v", err)
+	}
+
+	if string(data) != "stream two" {
+		t.Errorf("stream2 expected %q, got %q", "stream two", data)
+	}
+}
+
+func TestClient_Stream_CancelledContext(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		conn:   c1,
+		demux:  demux,
+		closed: closed,
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	stream, err := c.Stream(
+		ctx,
+		"Echo",
+		[]byte("payload"),
+	)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	if stream != nil {
+		t.Fatalf("expected nil stream, got %+v", stream)
+	}
+}
+
+func TestClientStream_EndUnregistersStream(t *testing.T) {
+	demux := wire.NewDemultiplexer()
+	streamID := uint32(1)
+
+	ch := demux.Register(streamID)
+
+	stream := &ClientStream{
+		StreamID: streamID,
+		ch:       ch,
+		ctx:      t.Context(),
+		demux: 	demux,
+	}
+
+	demux.Dispatch(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeEnd,
+	})
+
+	data, err := stream.Recv()
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF, got %v", err)
+	}
+
+	if data != nil {
+		t.Fatalf("expected nil data, got %q", data)
+	}
+
+	t.Logf("GetRegistry returned err=%v", err)
+
+	if err == nil {
+		t.Errorf("expected stream to be unregistered after END")
 	}
 }

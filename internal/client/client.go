@@ -115,14 +115,22 @@ const (
 )
 
 func (c *Client) ensureConnected(ctx context.Context) error {
+	// The caller has already cancelled the operation.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	select {
 	case <-c.Closed():
-		// dead, fall through to reconnect
+		// Connection is dead, fall through to reconnect.
 	default:
-		return nil // still alive, nothing to do
+		return nil // connection is alive
 	}
 
 	var err error
+
 	for attempt := 1; attempt <= maxReconnectAttempts; attempt++ {
 		if err = c.connect(); err == nil {
 			return nil
@@ -141,14 +149,22 @@ func (c *Client) ensureConnected(ctx context.Context) error {
 		jitter := time.Duration(rand.Int63n(int64(delay / 2)))
 		totalSleep := delay + jitter
 
-		fmt.Printf("Reconnect attempt %d failed. Retrying in %v...\n", attempt, totalSleep)
+		fmt.Printf(
+			"Reconnect attempt %d failed. Retrying in %v...\n",
+			attempt,
+			totalSleep,
+		)
 
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("reconnection aborted: %w", ctx.Err())
 		case <-time.After(totalSleep):
-			// Sleep finished, loop continues to the next connection attempt
 		}
 	}
-	return fmt.Errorf("failed to reconnect after %d attempts: %w", maxReconnectAttempts, err)
+
+	return fmt.Errorf(
+		"failed to reconnect after %d attempts: %w",
+		maxReconnectAttempts,
+		err,
+	)
 }

@@ -12,6 +12,7 @@ type ClientStream struct {
 	StreamID uint32
 	ch <-chan wire.Frame
 	ctx context.Context
+	demux *wire.Demultiplexer
 }
 
 func (c *Client) Stream(ctx context.Context, method string, request []byte) (*ClientStream, error) {
@@ -29,12 +30,14 @@ func (c *Client) Stream(ctx context.Context, method string, request []byte) (*Cl
 	ch := demux.Register(streamID)
 
 	headerFrame := wire.Frame{StreamID: streamID, Type: wire.FrameTypeHeader, Payload: []byte(method)}
-	if _, err := conn.Write(wire.EncodeFrame(headerFrame)); err != nil {
+	if _, err := conn.Write(wire.EncodeFrame(headerFrame)); err != nil { 
+		demux.Unregister(streamID)
 		return nil, fmt.Errorf("failed to write header frame: %w", err)
 	}
 
 	dataFrame := wire.Frame{StreamID: streamID, Type: wire.FrameTypeData, Payload: request}
 	if _, err := conn.Write(wire.EncodeFrame(dataFrame)); err != nil {
+		 demux.Unregister(streamID)
 		return nil, fmt.Errorf("failed to write data frame: %w", err)
 	}
 
@@ -42,6 +45,7 @@ func (c *Client) Stream(ctx context.Context, method string, request []byte) (*Cl
 		StreamID: streamID,
 		ch: ch,
 		ctx: ctx,
+		demux: wire.NewDemultiplexer(),
 	}, nil
 }
 
@@ -57,6 +61,7 @@ func (c *ClientStream) Recv() ([]byte, error) {
 			}
 
 			if frame.Type == wire.FrameTypeEnd {
+				c.demux.Unregister(c.StreamID)
 				return nil, io.EOF
 			}
 
