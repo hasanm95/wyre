@@ -15,7 +15,34 @@ type ClientStream struct {
 }
 
 func (c *Client) Stream(ctx context.Context, method string, request []byte) (*ClientStream, error) {
-	return nil, nil
+	err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	conn := c.conn
+	demux := c.demux
+	c.mu.Unlock()
+
+	streamID := c.newStreamID()
+	ch := demux.Register(streamID)
+
+	headerFrame := wire.Frame{StreamID: streamID, Type: wire.FrameTypeHeader, Payload: []byte(method)}
+	if _, err := conn.Write(wire.EncodeFrame(headerFrame)); err != nil {
+		return nil, fmt.Errorf("failed to write header frame: %w", err)
+	}
+
+	dataFrame := wire.Frame{StreamID: streamID, Type: wire.FrameTypeData, Payload: request}
+	if _, err := conn.Write(wire.EncodeFrame(dataFrame)); err != nil {
+		return nil, fmt.Errorf("failed to write data frame: %w", err)
+	}
+
+	return &ClientStream{
+		StreamID: streamID,
+		ch: ch,
+		ctx: ctx,
+	}, nil
 }
 
 func (c *ClientStream) Recv() ([]byte, error) {

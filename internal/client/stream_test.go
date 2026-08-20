@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/hasanm95/wyre/internal/wire"
 )
@@ -224,5 +226,94 @@ func TestClientStream_Recv_ContextCancelled(t *testing.T) {
 
 	if data != nil {
 		t.Errorf("expected nil data, got %q", data)
+	}
+}
+
+func TestClient_Stream_SendsHeaderAndData(t *testing.T) {
+	c1, c2 := net.Pipe()
+
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	demux := wire.NewDemultiplexer()
+	closed := make(chan struct{})
+
+	c := &Client{
+		conn:   c1,
+		demux:  demux,
+		closed: closed,
+	}
+
+	type streamResult struct {
+		stream *ClientStream
+		err    error
+	}
+
+	result := make(chan streamResult, 1)
+
+	go func() {
+		stream, err := c.Stream(
+			t.Context(),
+			"Echo",
+			[]byte("hello"),
+		)
+		result <- streamResult{stream, err}
+	}()
+
+	header, err := wire.ReadFrame(c2)
+	if err != nil {
+		t.Fatalf("failed to read header frame: %v", err)
+	}
+
+	if header.Type != wire.FrameTypeHeader {
+		t.Errorf("expected FrameTypeHeader, got %d", header.Type)
+	}
+
+	if string(header.Payload) != "Echo" {
+		t.Errorf("expected method %q, got %q", "Echo", header.Payload)
+	}
+
+	data, err := wire.ReadFrame(c2)
+	if err != nil {
+		t.Fatalf("failed to read data frame: %v", err)
+	}
+
+	if data.Type != wire.FrameTypeData {
+		t.Errorf("expected FrameTypeData, got %d", data.Type)
+	}
+
+	if string(data.Payload) != "hello" {
+		t.Errorf("expected payload %q, got %q", "hello", data.Payload)
+	}
+
+	if header.StreamID != data.StreamID {
+		t.Errorf(
+			"expected same stream ID, got header=%d, data=%d",
+			header.StreamID,
+			data.StreamID,
+		)
+	}
+
+	select {
+	case result := <-result:
+		if result.err != nil {
+			t.Fatalf("Stream failed: %v", result.err)
+		}
+
+		if result.stream == nil {
+			t.Fatal("expected non-nil ClientStream")
+		}
+
+		if result.stream.StreamID != header.StreamID {
+			t.Errorf(
+				"expected stream ID %d, got %d",
+				header.StreamID,
+				result.stream.StreamID,
+			)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stream did not return")
 	}
 }
