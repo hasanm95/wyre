@@ -66,23 +66,6 @@ func TestDispatcher_RegisterDuplicateMethod(t *testing.T) {
 	}
 }
 
-// func TestDispatcher_RegisterEmptyMethodName(t *testing.T) {
-// 	dispatcher := NewDispatcher()
-
-// 	handler := func() {
-		
-// 	}
-
-// 	dispatcher.Register("", handler)
-
-// 	_, ok := dispatcher.Lookup("")
-
-// 	if ok {
-// 		t.Error("expected ok to be false, got true")
-// 	}
-// }
-
-
 func TestDispatcher_ConcurrentRegisterAndLookup(t *testing.T) {
 	dispatcher := NewDispatcher()
 
@@ -194,5 +177,84 @@ func TestDispatcher_PropagatesHandlerError(t *testing.T) {
 
 	if !errors.Is(err, expectedErr) {
 		t.Errorf("expected error %v, got %v", expectedErr, err)
+	}
+}
+
+func TestDispatcher_RegisterAndLookupStream(t *testing.T) {
+	dispatcher := NewDispatcher()
+
+	dispatcher.RegisterStream("Greeter.SayHelloStream", func(payload []byte, send func([]byte) error) error {
+		return send([]byte("chunk"))
+	})
+
+	got, ok := dispatcher.LookupStream("Greeter.SayHelloStream")
+	if !ok {
+		t.Fatal("expected stream handler to be found")
+	}
+
+	var received []byte
+	fakeSend := func(b []byte) error {
+		received = b
+		return nil
+	}
+
+	err := got([]byte("request"), fakeSend)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if string(received) != "chunk" {
+		t.Errorf("expected send to receive %q, got %q", "chunk", received)
+	}
+}
+
+func TestDispatcher_LookupStreamUnknownMethod(t *testing.T) {
+	dispatcher := NewDispatcher()
+
+	_, ok := dispatcher.LookupStream("Greeter.Unknown")
+	if ok {
+		t.Error("expected stream method to not be found")
+	}
+}
+
+func TestDispatcher_UnaryAndStreamRegistriesAreIndependent(t *testing.T) {
+	dispatcher := NewDispatcher()
+
+	dispatcher.Register("Greeter.SayHello", func(b []byte) ([]byte, error) {
+		return []byte("unary"), nil
+	})
+
+	dispatcher.RegisterStream("Greeter.SayHello", func(payload []byte, send func([]byte) error) error {
+		return send([]byte("stream"))
+	})
+
+	unaryHandler, ok := dispatcher.Lookup("Greeter.SayHello")
+	if !ok {
+		t.Fatal("expected unary handler to be found")
+	}
+
+	unaryResp, err := unaryHandler([]byte("req"))
+	if err != nil {
+		t.Fatalf("unary handler failed: %v", err)
+	}
+	if string(unaryResp) != "unary" {
+		t.Errorf("expected %q, got %q", "unary", unaryResp)
+	}
+
+	streamHandler, ok := dispatcher.LookupStream("Greeter.SayHello")
+	if !ok {
+		t.Fatal("expected stream handler to be found")
+	}
+
+	var received []byte
+	err = streamHandler([]byte("req"), func(b []byte) error {
+		received = b
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stream handler failed: %v", err)
+	}
+	if string(received) != "stream" {
+		t.Errorf("expected %q, got %q", "stream", received)
 	}
 }

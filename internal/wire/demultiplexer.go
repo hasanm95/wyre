@@ -95,10 +95,8 @@ func (s *Demultiplexer) Dispatch(f Frame) {
 		stream.mu.Unlock()
 		return
 	case stream.ch <- f:
-	default:
-		log.Printf("Stream %d buffer is full! Dropping frame.", f.StreamID)
+		stream.mu.Unlock()
 	}
-	stream.mu.Unlock()
 }
 
 func (s *Demultiplexer) Unregister(streamID uint32) {

@@ -44,6 +44,11 @@ func (h *ConnHandler) handleNewStream(f wire.Frame) {
 	methodName := string(f.Payload)
 	ch := h.demux.Register(f.StreamID)
 
+	if streamHandler, ok := h.dispatcher.LookupStream(methodName); ok {
+		go h.runStreamCall(f.StreamID, streamHandler, ch)
+		return
+	}
+
 	go h.runCall(f.StreamID, methodName, ch)
 }
 
@@ -92,6 +97,53 @@ func (h *ConnHandler) runCall(streamID uint32, methodName string, ch <-chan wire
 		Payload:  wire.EncodeStatus(wire.StatusOK, ""),
 	}); err != nil {
 		log.Printf("failed to write status frame for stream %d: %v", streamID, err)
+	}
+}
+
+func (h *ConnHandler) runStreamCall(streamID uint32, handler StreamHandler, ch <-chan wire.Frame) {
+	defer h.demux.Unregister(streamID)
+
+	dataFrame, ok := <-ch
+	if !ok {
+		return
+	}
+	if dataFrame.Type != wire.FrameTypeData {
+		return
+	}
+
+   send := func(payload []byte) error {
+       return h.writeFrame(wire.Frame{
+           StreamID: streamID,
+           Type:     wire.FrameTypeData,
+           Payload:  payload,
+       })
+   }
+
+   err := handler(dataFrame.Payload, send)
+
+   if err != nil {
+		statusCode := wire.StatusInternal
+		if errors.Is(err, ErrMethodNotFound) {
+			statusCode = wire.StatusNotFound
+		}
+
+		statusFrame := wire.Frame {
+			StreamID: streamID,
+			Type: wire.FrameTypeStatus,
+			Payload: wire.EncodeStatus(statusCode, err.Error()),
+		}
+		if err := h.writeFrame(statusFrame); err != nil {
+			log.Printf("failed to write status for stream %d: %v", streamID, err)
+		}
+		return
+   }
+
+   	if err := h.writeFrame(wire.Frame{
+		StreamID: streamID,
+		Type:     wire.FrameTypeEnd,
+		Payload:  []byte(""),
+	}); err != nil {
+		log.Printf("failed to write response for stream %d: %v", streamID, err)
 	}
 }
 

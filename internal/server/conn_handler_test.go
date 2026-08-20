@@ -411,3 +411,129 @@ func TestConnHandler_HandlerError_SendsInternalStatus(t *testing.T) {
 		t.Errorf("expected message %q, got %q", expectedError, message)
 	}
 }
+
+func TestConnHandler_HandlesStreamingCall(t *testing.T) {
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	dispatcher := NewDispatcher()
+	dispatcher.RegisterStream("Greeter.SayHelloStream", func(payload []byte, send func([]byte) error) error {
+		if err := send([]byte("chunk1")); err != nil {
+			return err
+		}
+		if err := send([]byte("chunk2")); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	handler := NewConnHandler(c2, dispatcher)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- handler.Serve() }()
+
+	go func() {
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1, Type: wire.FrameTypeHeader, Payload: []byte("Greeter.SayHelloStream"),
+		}))
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1, Type: wire.FrameTypeData, Payload: []byte("request"),
+		}))
+	}()
+
+	frame1, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read first chunk: %v", err)
+	}
+	if frame1.Type != wire.FrameTypeData {
+		t.Errorf("expected FrameTypeData, got %d", frame1.Type)
+	}
+	if string(frame1.Payload) != "chunk1" {
+		t.Errorf("expected %q, got %q", "chunk1", frame1.Payload)
+	}
+
+	frame2, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read second chunk: %v", err)
+	}
+	if frame2.Type != wire.FrameTypeData {
+		t.Errorf("expected FrameTypeData, got %d", frame2.Type)
+	}
+	if string(frame2.Payload) != "chunk2" {
+		t.Errorf("expected %q, got %q", "chunk2", frame2.Payload)
+	}
+
+	endFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read end frame: %v", err)
+	}
+	if endFrame.Type != wire.FrameTypeEnd {
+		t.Errorf("expected FrameTypeEnd, got %d", endFrame.Type)
+	}
+	if endFrame.StreamID != 1 {
+		t.Errorf("expected stream ID 1, got %d", endFrame.StreamID)
+	}
+
+	c1.Close()
+	<-serveErr
+}
+
+func TestConnHandler_StreamingCall_HandlerError_SendsInternalStatus(t *testing.T) {
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		c1.Close()
+		c2.Close()
+	})
+
+	dispatcher := NewDispatcher()
+	expectedErr := "stream handler failed"
+
+	dispatcher.RegisterStream("Greeter.SayHelloStream", func(payload []byte, send func([]byte) error) error {
+		if err := send([]byte("chunk1")); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", expectedErr)
+	})
+
+	handler := NewConnHandler(c2, dispatcher)
+	go handler.Serve()
+
+	go func() {
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1, Type: wire.FrameTypeHeader, Payload: []byte("Greeter.SayHelloStream"),
+		}))
+		c1.Write(wire.EncodeFrame(wire.Frame{
+			StreamID: 1, Type: wire.FrameTypeData, Payload: []byte("request"),
+		}))
+	}()
+
+	chunkFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read chunk: %v", err)
+	}
+	if string(chunkFrame.Payload) != "chunk1" {
+		t.Errorf("expected %q, got %q", "chunk1", chunkFrame.Payload)
+	}
+
+	statusFrame, err := wire.ReadFrame(c1)
+	if err != nil {
+		t.Fatalf("failed to read status frame: %v", err)
+	}
+	if statusFrame.Type != wire.FrameTypeStatus {
+		t.Errorf("expected FrameTypeStatus, got %d", statusFrame.Type)
+	}
+
+	code, message, err := wire.DecodeStatus(statusFrame.Payload)
+	if err != nil {
+		t.Fatalf("failed to decode status: %v", err)
+	}
+	if code != wire.StatusInternal {
+		t.Errorf("expected %v, got %v", wire.StatusInternal, code)
+	}
+	if message != expectedErr {
+		t.Errorf("expected %q, got %q", expectedErr, message)
+	}
+}

@@ -2,10 +2,12 @@ package client
 
 import (
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/hasanm95/wyre/internal/server"
 	"github.com/hasanm95/wyre/internal/wire"
 	wyreproto "github.com/hasanm95/wyre/proto"
@@ -375,5 +377,64 @@ func TestClient_Call_HandlerError_ReturnsInternalStatus(t *testing.T) {
 			"handler failed",
 			statusErr.Message,
 		)
+	}
+}
+
+func TestClient_Stream_ReceivesMultipleChunksFromRealServer(t *testing.T) {
+	t.Log("1")
+	dispatcher := server.NewDispatcher()
+	dispatcher.RegisterStream("Greeter.SayHelloStream", func(payload []byte, send func([]byte) error) error {
+		for i := 0; i < 3; i++ {
+			t.Log("2-", i)
+			if err := send([]byte(fmt.Sprintf("chunk-%d", i))); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	t.Log("3")
+	srv := server.NewServer(dispatcher)
+	t.Log("4")
+	if err := srv.Listen("127.0.0.1:0"); err != nil {
+		t.Log("5")
+		t.Fatalf("failed to start test server: %v", err)
+	}
+	t.Log("6")
+	go srv.Serve()
+
+
+	t.Log("7")
+	c, err := Dial(srv.Addr().String())
+	if err != nil {
+		t.Fatalf("failed to dial: %v", err)
+	}
+
+	t.Log("8")
+	stream, err := c.Stream(t.Context(), "Greeter.SayHelloStream", []byte("request"))
+	if err != nil {
+		t.Fatalf("failed to open stream: %v", err)
+	}
+
+
+	t.Log("9")
+	var chunks []string
+	for {
+	t.Log("10")
+		data, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Recv failed: %v", err)
+		}
+	t.Log("11")
+		chunks = append(chunks, string(data))
+	}
+
+
+	t.Log("12")
+	expected := []string{"chunk-0", "chunk-1", "chunk-2"}
+	if diff := cmp.Diff(expected, chunks); diff != "" {
+		t.Errorf("mismatch (-want +got):\n%s", diff)
 	}
 }

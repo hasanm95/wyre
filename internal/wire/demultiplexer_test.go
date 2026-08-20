@@ -1,7 +1,6 @@
 package wire
 
 import (
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -61,7 +60,7 @@ func TestDispatch_DoesNotBlockWithoutConcurrentReceiver(t *testing.T) {
 	}
 }
 
-func TestDispatch_DoesNotBlockWhenBufferFull(t *testing.T) {
+func TestDispatch_BlocksWhenBufferFull(t *testing.T) {
 	stream := NewDemultiplexer()
 	stream.Register(5)
 
@@ -75,15 +74,16 @@ func TestDispatch_DoesNotBlockWhenBufferFull(t *testing.T) {
 	dispatchDone := make(chan struct{})
 
 	go func() {
-		stream.Dispatch(frame3)
+		stream.Dispatch(frame3) // buffer is full (2/2) — this should block
 		close(dispatchDone)
 	}()
 
+	// It should NOT return quickly, because nobody is reading yet.
 	select {
 	case <-dispatchDone:
-		fmt.Println("Success: Dispatch did not block on a full buffer!")
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("Dispatch did not return in time — it likely blocked because the channel buffer was full and no one was reading")
+		t.Fatal("Dispatch returned before the buffer had room — it should have blocked")
+	case <-time.After(100 * time.Millisecond):
+		// expected: still blocked
 	}
 
 	registry, _ := stream.GetRegistry(5)
@@ -93,16 +93,23 @@ func TestDispatch_DoesNotBlockWhenBufferFull(t *testing.T) {
 		t.Errorf("Expected 'hello', got %s", f1Out.Payload)
 	}
 
+	// Draining frame1 frees a slot — frame3's Dispatch should now be able
+	// to complete.
+	select {
+	case <-dispatchDone:
+		// expected: unblocked once there was room
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("Dispatch still blocked after buffer had room — expected it to complete")
+	}
+
 	f2Out := <-registry
 	if string(f2Out.Payload) != "world" {
 		t.Errorf("Expected 'world', got %s", f2Out.Payload)
 	}
 
-	select {
-	case unexpectedFrame := <-registry:
-		t.Errorf("frame3 was NOT dropped! Found payload: %s", string(unexpectedFrame.Payload))
-	default:
-		fmt.Println("Success Assertion: Confirmed that frame3 was dropped!")
+	f3Out := <-registry
+	if string(f3Out.Payload) != "what is going on" {
+		t.Errorf("Expected 'what is going on', got %s", f3Out.Payload)
 	}
 }
 

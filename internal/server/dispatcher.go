@@ -8,10 +8,12 @@ import (
 
 
 type Handler func([]byte) ([]byte, error)
+type StreamHandler func(payload []byte, send func([]byte) error) error
 
 type Dispatcher struct {
 	mu sync.Mutex
 	methods map[string]Handler
+	streamMethods map[string]StreamHandler
 }
 
 var ErrMethodNotFound = errors.New("method not found")
@@ -19,6 +21,7 @@ var ErrMethodNotFound = errors.New("method not found")
 func NewDispatcher() *Dispatcher  {
 	return &Dispatcher{
 		methods: make(map[string]Handler),
+		streamMethods: make(map[string]StreamHandler),
 	}
 }
 
@@ -48,4 +51,20 @@ func (d *Dispatcher) Dispatch(methodName string, request []byte)([]byte, error) 
 	response, err := handler(request)
 
 	return response, err
+}
+
+func (d *Dispatcher) RegisterStream(methodName string, handler StreamHandler){
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.streamMethods[methodName] = handler
+}
+
+func (d *Dispatcher) LookupStream(methodName string) (StreamHandler, bool)  {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	medthod, ok := d.streamMethods[methodName]
+
+	return medthod, ok
 }
