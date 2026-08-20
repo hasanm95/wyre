@@ -14,6 +14,8 @@ const (
 const (
     FrameTypeHeader uint8 = 1
     FrameTypeData   uint8 = 2
+	FrameTypeStatus uint8 = 3
+	FrameTypeEnd    uint8 = 4
 )
 
 type Frame struct {

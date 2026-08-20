@@ -2,7 +2,7 @@ package wire
 
 import "fmt"
 
-const FrameTypeStatus uint8 = 3
+
 
 type StatusCode uint8
 

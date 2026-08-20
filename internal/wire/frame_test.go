@@ -221,3 +221,25 @@ func TestFrame_TypeConstants(t *testing.T) {
 		})
 	}
 }
+
+func TestEncodeDecodeFrame_End(t *testing.T) {
+	frame := Frame{
+		StreamID: 1,
+		Type:     FrameTypeEnd,
+		Payload:  []byte(""),
+	}
+	frameEncodedData := EncodeFrame(frame)
+	decodedFrame, err := DecodeFrame(frameEncodedData)
+
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+
+	if decodedFrame.StreamID != 1 {
+		t.Errorf("expected stream id 1, got %d", decodedFrame.StreamID)
+	}
+
+	if decodedFrame.Type != FrameTypeEnd {
+		t.Errorf("expected type %d, got %d", FrameTypeEnd, decodedFrame.Type)
+	}
+}
